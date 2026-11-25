@@ -1,0 +1,89 @@
+
+name: Sync Google Drive Notebook
+
+on:
+  schedule:
+    - cron: '15,45 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: google-drive-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-notebook:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install google-auth google-api-python-client nbformat
+
+      - name: Download notebook from Google Drive
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_NOTEBOOK_ID: ${{ secrets.GOOGLE_DRIVE_NOTEBOOK_ID }}
+        run: |
+          python <<'PYTHON'
+          import os
+          import json
+          import nbformat
+          from pathlib import Path
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+
+          credentials = service_account.Credentials.from_service_account_info(
+              json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
+              scopes=["https://www.googleapis.com/auth/drive.readonly"]
+          )
+
+          service = build(
+              "drive", "v3",
+              credentials=credentials
+          )
+
+          file_id = os.environ["GOOGLE_DRIVE_NOTEBOOK_ID"]
+
+          content = service.files().get_media(
+              fileId=file_id,
+              supportsAllDrives=True
+          ).execute(num_retries=3)
+
+          # Validate the notebook before saving it.
+          notebook = nbformat.reads(
+              content.decode("utf-8"),
+              as_version=4
+          )
+          nbformat.validate(notebook)
+
+          filename = "CS505_Predictive_Maintenance.ipynb"
+          Path(filename).write_bytes(content)
+
+          print(f"Successfully downloaded and validated {filename}")
+          PYTHON
+
+      - name: Commit and push notebook updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add CS505_Predictive_Maintenance.ipynb
+
+          if git diff --cached --quiet; then
+            echo "No changes detected. Repository is up to date."
+          else
+            git commit -m "Sync notebook from Google Drive"
+            git push
+          fi
