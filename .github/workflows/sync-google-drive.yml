@@ -1,5 +1,4 @@
-
-name: Sync Google Drive Notebook
+name: Sync Google Drive Project
 
 on:
   schedule:
@@ -14,10 +13,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sync-notebook:
+  sync-project:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,63 +25,192 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: |
-          pip install google-auth google-api-python-client nbformat
+      - name: Install synchronization dependencies
+        run: python -m pip install google-auth google-api-python-client nbformat
 
-      - name: Download notebook from Google Drive
+      - name: Sync approved project files
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
           GOOGLE_DRIVE_NOTEBOOK_ID: ${{ secrets.GOOGLE_DRIVE_NOTEBOOK_ID }}
         run: |
           python <<'PYTHON'
-          import os
+          import hashlib
           import json
-          import nbformat
+          import os
+          import subprocess
+          from collections import defaultdict
           from pathlib import Path
+
+          import nbformat
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
 
+          ROOT_ID = os.environ['GOOGLE_DRIVE_FOLDER_ID'].strip()
+          NOTEBOOK_ID = os.environ['GOOGLE_DRIVE_NOTEBOOK_ID'].strip()
+          NOTEBOOK_NAME = 'CS505_Predictive_Maintenance.ipynb'
+          FOLDER = 'application/vnd.google-apps.folder'
+          GOOGLE_NATIVE = 'application/vnd.google-apps.'
+          MAX_SIZE = 25 * 1024 * 1024  # 25 MiB per file
+          CODE = {'.py', '.ipynb'}
+          CONFIG = {'.json', '.yaml', '.yml', '.txt', '.csv'}
+          DATA = {'.csv', '.parquet', '.npy', '.npz', '.json'}
+          RESULTS = CONFIG | {'.png', '.jpg', '.jpeg', '.svg', '.pdf'}
+          SKIP_NAMES = {'_macosx', '__pycache__', 'credentials', 'secrets', 'venv', 'node_modules'}
+
           credentials = service_account.Credentials.from_service_account_info(
-              json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
-              scopes=["https://www.googleapis.com/auth/drive.readonly"]
+              json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON']),
+              scopes=['https://www.googleapis.com/auth/drive.readonly'],
           )
+          drive = build('drive', 'v3', credentials=credentials, cache_discovery=False)
+          main_seen = False
+          counts = {'updated': 0, 'unchanged': 0, 'skipped': 0}
 
-          service = build(
-              "drive", "v3",
-              credentials=credentials
-          )
+          def children(folder_id):
+              token = None
+              while True:
+                  page = drive.files().list(
+                      q=f"'{folder_id}' in parents and trashed = false",
+                      fields='nextPageToken,incompleteSearch,files(id,name,mimeType,size,md5Checksum,modifiedTime)',
+                      pageSize=1000, pageToken=token,
+                      supportsAllDrives=True, includeItemsFromAllDrives=True,
+                  ).execute(num_retries=3)
+                  if page.get('incompleteSearch'):
+                      raise RuntimeError('Google Drive returned an incomplete listing.')
+                  yield from page.get('files', [])
+                  token = page.get('nextPageToken')
+                  if not token:
+                      break
 
-          file_id = os.environ["GOOGLE_DRIVE_NOTEBOOK_ID"]
+          def safe_name(name):
+              lower = name.lower()
+              return (bool(name) and not name.startswith('.')
+                      and lower not in SKIP_NAMES
+                      and not any(c in name for c in '/\\:\r\n\x00')
+                      and not any(word in lower for word in
+                                  ('credential', 'service-account', 'service_account', 'private-key', 'private_key', 'secret')))
 
-          content = service.files().get_media(
-              fileId=file_id,
-              supportsAllDrives=True
-          ).execute(num_retries=3)
+          def folder_allowed(parts):
+              if len(parts) == 1:
+                  return parts[0] in {'data', 'results', 'models', 'scripts', 'src'}
+              if parts[0] == 'data':
+                  return parts[1] == 'processed'
+              return parts[0] in {'results', 'models', 'scripts', 'src'}
 
-          # Validate the notebook before saving it.
-          notebook = nbformat.reads(
-              content.decode("utf-8"),
-              as_version=4
-          )
-          nbformat.validate(notebook)
+          def file_allowed(parts):
+              ext = Path(parts[-1]).suffix.lower()
+              if len(parts) == 1:
+                  return ext in CODE
+              if parts[0] == 'data':
+                  return parts[1] == 'processed' and len(parts) >= 3 and ext in DATA
+              if parts[0] == 'results':
+                  return ext in RESULTS
+              if parts[0] == 'models':
+                  return ext in CONFIG
+              if parts[0] in {'scripts', 'src'}:
+                  return ext in CODE | CONFIG
+              return False
 
-          filename = "CS505_Predictive_Maintenance.ipynb"
-          Path(filename).write_bytes(content)
+          def skip():
+              counts['skipped'] += 1
 
-          print(f"Successfully downloaded and validated {filename}")
+          def select_entry(entries, parts):
+              # Use the original notebook ID even if another copy has its name.
+              if parts == (NOTEBOOK_NAME,):
+                  matches = [f for f in entries if f['id'] == NOTEBOOK_ID]
+                  if len(matches) != 1 or matches[0]['mimeType'].startswith(GOOGLE_NATIVE):
+                      raise RuntimeError('Original notebook not found at the expected project path.')
+                  if len(entries) > 1:
+                      print('Duplicate notebook name: using the configured original notebook.')
+                  return matches[0]
+              if len(entries) == 1:
+                  return entries[0]
+              if any(f['mimeType'] == FOLDER for f in entries):
+                  raise RuntimeError(f'Ambiguous duplicate folder or file: {Path(*parts)}')
+              print(f'Duplicate Drive filename: {Path(*parts)}; selecting newest modified copy.')
+              return max(entries, key=lambda f: (f.get('modifiedTime', ''), f['id']))
+
+          def sync_file(item, parts):
+              global main_seen
+              path = Path(*parts)
+              is_main = parts == (NOTEBOOK_NAME,)
+              size = item.get('size')
+              if size is None or int(size) > MAX_SIZE:
+                  if is_main:
+                      raise RuntimeError('Main notebook is missing size metadata or exceeds the size limit.')
+                  print(f'Skipped (missing size or over 25 MiB): {path}')
+                  skip()
+                  return
+              # Never follow repository symlinks when writing synchronized files.
+              if any(p.is_symlink() for p in (path, *path.parents)):
+                  raise RuntimeError(f'Unsafe symlink path: {path}')
+              checksum = item.get('md5Checksum')
+              if path.is_file() and checksum and hashlib.md5(path.read_bytes()).hexdigest() == checksum:
+                  counts['unchanged'] += 1
+              else:
+                  content = drive.files().get_media(
+                      fileId=item['id'], supportsAllDrives=True,
+                  ).execute(num_retries=3)
+                  if len(content) > MAX_SIZE:
+                      raise RuntimeError(f'File changed or exceeded size limit: {path}')
+                  if checksum and hashlib.md5(content).hexdigest() != checksum:
+                      raise RuntimeError(f'File changed during synchronization: {path}; rerun workflow.')
+                  if path.suffix.lower() == '.ipynb':
+                      nbformat.validate(nbformat.reads(content.decode('utf-8'), as_version=4))
+                  # Basic guard for common private-key formats. Not a full secret scan.
+                  if b'-----BEGIN PRIVATE KEY-----' in content or b'-----BEGIN RSA PRIVATE KEY-----' in content:
+                      raise RuntimeError(f'Possible private key detected in {path}; refusing to commit.')
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(content)
+                  counts['updated'] += 1
+                  print(f'Synchronized: {path}')
+              # Stage only explicitly approved files, not unrelated GitHub files.
+              subprocess.run(['git', 'add', '--', str(path)], check=True)
+              if is_main:
+                  main_seen = True
+
+          def walk(folder_id, parent=()):
+              by_name = defaultdict(list)
+              for item in children(folder_id):
+                  name = item['name']
+                  if not safe_name(name):
+                      skip()
+                      continue
+                  parts = parent + (name,)
+                  mime = item['mimeType']
+                  if mime == FOLDER:
+                      allowed = folder_allowed(parts)
+                  elif mime.startswith(GOOGLE_NATIVE):
+                      allowed = False  # Includes shortcuts and Google Docs/Slides.
+                  else:
+                      allowed = file_allowed(parts)
+                  if allowed:
+                      by_name[name].append(item)
+                  else:
+                      skip()
+              for name, entries in sorted(by_name.items()):
+                  parts = parent + (name,)
+                  item = select_entry(entries, parts)
+                  if item['mimeType'] == FOLDER:
+                      walk(item['id'], parts)
+                  else:
+                      sync_file(item, parts)
+
+          if not ROOT_ID or not NOTEBOOK_ID:
+              raise RuntimeError('Missing Google Drive folder ID or notebook ID.')
+          walk(ROOT_ID)
+          if not main_seen:
+              raise RuntimeError('Main notebook was not synchronized; check folder access and IDs.')
+          print('Synchronization summary:', counts)
           PYTHON
 
-      - name: Commit and push notebook updates
+      - name: Commit and push approved updates
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add CS505_Predictive_Maintenance.ipynb
-
           if git diff --cached --quiet; then
             echo "No changes detected. Repository is up to date."
           else
-            git commit -m "Sync notebook from Google Drive"
+            git commit -m "Sync project files from Google Drive"
             git push
           fi
