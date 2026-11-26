@@ -221,3 +221,36 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# ==========================================
+# CS505 Predictive Maintenance Project
+# ==========================================
+
+# Raw datasets and archives
+data/raw/
+*.zip
+*.rar
+
+# Serialized models
+*.joblib
+*.pkl
+*.pickle
+
+# System and temporary files
+_MACOSX/
+__MACOSX/
+.DS_Store
+._*
+.extraction_complete
+.write_test_*
+.ipynb_checkpoints/
+__pycache__/
+
+# Credentials and sensitive files
+credentials.json
+service-account*.json
+.env
+.env.*
+*.pem
+*.key
